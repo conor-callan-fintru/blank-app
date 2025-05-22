@@ -65,7 +65,7 @@ SEVERITY_LEVELS = {
 
 # --- Helper Functions ---
 
-@st.cache_data(ttl=300) # Cache data for 5 minutes
+@st.cache_data(ttl=300) # Cache data for 5 mins
 def load_azure_table_data():
     """Load data from Azure Table Storage"""
     try:
