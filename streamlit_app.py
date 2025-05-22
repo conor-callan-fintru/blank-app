@@ -323,33 +323,62 @@ with tab3: # New Power Automate Tab
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("Flow Run Status Distribution")
-            if 'success' in flow_runs_df.columns and not flow_runs_df['success'].empty:
-                status_counts = flow_runs_df['success'].value_counts().reset_index(name='Count')
-                status_counts.columns = ['Status', 'Count']
-                status_counts['Status'] = status_counts['Status'].map({True: 'Successful', False: 'Failed'})
+            st.subheader("Flow Runs by Display Name (Last 24 Hours)")
+            
+            # Filter data for the last 24 hours
+            past_24_hours_flows_df = flow_runs_df[
+                flow_runs_df['timestamp'] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=1))
+            ]
+
+            if 'DisplayName' in past_24_hours_flows_df.columns and not past_24_hours_flows_df['DisplayName'].empty:
+                # Count occurrences of each DisplayName
+                flow_name_counts = past_24_hours_flows_df['DisplayName'].value_counts().reset_index(name='Count')
+                flow_name_counts.columns = ['Flow Display Name', 'Count']
                 
-                fig = px.pie(status_counts, values='Count', names='Status', hole=0.4,
-                             color_discrete_map={'Successful':'green', 'Failed':'red'})
-                fig.update_traces(textinfo='label+percent', hovertemplate='%{label}: %{value} (%{percent})')
+                fig = px.pie(flow_name_counts, values='Count', names='Flow Display Name', hole=0.4)
+                fig.update_traces(textinfo='value', hovertemplate='%{label}: %{value}')
                 fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No run status data available for charting.")
+                st.info("No flow run data available for charting in the last 24 hours.")
         
         with col2:
-            st.subheader("Top 5 Failing Flows")
-            failed_flows_df = flow_runs_df[flow_runs_df['success'] == False]
-            if 'DisplayName' in failed_flows_df.columns and not failed_flows_df.empty:
-                top_failed_flows = failed_flows_df['DisplayName'].value_counts().head(5).reset_index(name='Failures')
-                top_failed_flows.columns = ['Flow Display Name', 'Failures']
+            # Filterable Table for All Flow Runs - showing counts of each flow
+            st.subheader("Flow Run Counts")
+        
+            # We'll still allow filtering by Display Name and Success Status
+            col_flt1, col_flt2 = st.columns(2)
+            with col_flt1:
+                flow_display_name_options = ['All'] + sorted(flow_runs_df['DisplayName'].unique().tolist()) if 'DisplayName' in flow_runs_df.columns else ['All']
+                selected_flow_display_name = st.selectbox("Filter by Flow Display Name (for counts)", flow_display_name_options)
+            with col_flt2:
+                success_status_options = ['All', 'Successful', 'Failed']
+                selected_success_status = st.selectbox("Filter by Run Status (for counts)", success_status_options)
 
-                fig = px.bar(top_failed_flows, x='Flow Display Name', y='Failures', color='Failures',
-                             title="Top 5 Power Automate Flows with Failures")
-                fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
-                st.plotly_chart(fig, use_container_width=True)
+            # Apply filters to the original DataFrame first
+            filtered_for_counts_df = flow_runs_df.copy()
+
+            if selected_flow_display_name != 'All' and 'DisplayName' in filtered_for_counts_df.columns:
+                filtered_for_counts_df = filtered_for_counts_df[filtered_for_counts_df['DisplayName'] == selected_flow_display_name]
+            
+            if selected_success_status != 'All' and 'success' in filtered_for_counts_df.columns:
+                if selected_success_status == 'Successful':
+                    filtered_for_counts_df = filtered_for_counts_df[filtered_for_counts_df['success'] == True]
+                elif selected_success_status == 'Failed':
+                    filtered_for_counts_df = filtered_for_counts_df[filtered_for_counts_df['success'] == False]
+
+            # Now, group by DisplayName and count the occurrences
+            if not filtered_for_counts_df.empty and 'DisplayName' in filtered_for_counts_df.columns:
+                flow_summary_df = filtered_for_counts_df.groupby('DisplayName').size().reset_index(name='Run Count')
+                flow_summary_df.columns = ['Flow Display Name', 'Run Count'] # Rename columns for clarity
+                
+                # Sort by Run Count in descending order
+                flow_summary_df = flow_summary_df.sort_values('Run Count', ascending=False)
+
+                st.dataframe(flow_summary_df, use_container_width=True, hide_index=True)
             else:
-                st.info("No failed flow data available for charting.")
+                st.info("No flow runs match the selected filters to display counts.")
+
 
         # Flow Run Trend over Time
         st.subheader("Power Automate Flow Run Trend")
@@ -371,34 +400,6 @@ with tab3: # New Power Automate Tab
             st.dataframe(failed_runs_sorted_df[display_cols_failed], use_container_width=True, hide_index=True)
         else:
             st.info("No recent failed flow runs to display.")
-
-        # Filterable Table for All Flow Runs
-        st.subheader("All Flow Runs")
-        
-        col_flt1, col_flt2 = st.columns(2)
-        with col_flt1:
-            flow_display_name_options = ['All'] + sorted(flow_runs_df['DisplayName'].unique().tolist()) if 'DisplayName' in flow_runs_df.columns else ['All']
-            selected_flow_display_name = st.selectbox("Filter by Flow Display Name", flow_display_name_options)
-        with col_flt2:
-            success_status_options = ['All', 'Successful', 'Failed']
-            selected_success_status = st.selectbox("Filter by Run Status", success_status_options)
-
-        filtered_flow_runs_df = flow_runs_df.copy()
-
-        if selected_flow_display_name != 'All' and 'DisplayName' in filtered_flow_runs_df.columns:
-            filtered_flow_runs_df = filtered_flow_runs_df[filtered_flow_runs_df['DisplayName'] == selected_flow_display_name]
-        
-        if selected_success_status != 'All' and 'success' in filtered_flow_runs_df.columns:
-            if selected_success_status == 'Successful':
-                filtered_flow_runs_df = filtered_flow_runs_df[filtered_flow_runs_df['success'] == True]
-            elif selected_success_status == 'Failed':
-                filtered_flow_runs_df = filtered_flow_runs_df[filtered_flow_runs_df['success'] == False]
-
-        if not filtered_flow_runs_df.empty:
-            display_cols_all_runs = ['timestamp', 'DisplayName', 'success', 'ErrorCode', 'ErrorMessage', 'RunID']
-            st.dataframe(filtered_flow_runs_df.sort_values('timestamp', ascending=False)[display_cols_all_runs], use_container_width=True, hide_index=True)
-        else:
-            st.info("No flow runs match the selected filters.")
 
 
 # Refresh button
