@@ -3,6 +3,8 @@ import pandas as pd
 import datetime
 from azure.data.tables import TableServiceClient
 import plotly.express as px
+import requests
+import json # You already have this import
 
 # --- Configuration and Constants ---
 
@@ -48,19 +50,42 @@ st.markdown("""
 
 # Azure Table Storage connection details using Streamlit Secrets
 # You'll need to set these in your .streamlit/secrets.toml file
-# Example secrets.toml:
-# AZURE_STORAGE_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=supportsacc;AccountKey=YOUR_ACCOUNT_KEY;EndpointSuffix=core.windows.net"
-# AZURE_TABLE_NAME = "SupportAlertsTable"
 CONNECTION_STRING = st.secrets["AZURE_STORAGE_CONNECTION_STRING"]
 TABLE_NAME = st.secrets["AZURE_TABLE_NAME"]
+
+# Azure Log Analytics connection details
+# You'll need to set these in your .streamlit/secrets.toml file
+LOG_ANALYTICS_APP_ID = st.secrets["LOG_ANALYTICS_APP_ID"]
+LOG_ANALYTICS_API_KEY = st.secrets["LOG_ANALYTICS_API_KEY"]
+LOG_ANALYTICS_API_URL = f"https://api.loganalytics.io/v1/apps/{LOG_ANALYTICS_APP_ID}/query"
+LOG_ANALYTICS_ENV_ID = st.secrets["LOG_ANALYTICS_ENV_ID"]
+
+# Define the KQL query to fetch data from Azure Log Analytics
+requests_query = f""" 
+requests
+| where timestamp > ago(7d)
+| where customDimensions['resourceProvider'] == 'Cloud Flow'
+| where customDimensions['signalCategory'] == 'Cloud flow runs'
+| where customDimensions['environmentId'] == '{LOG_ANALYTICS_ENV_ID}'
+| extend Data = todynamic(tostring(customDimensions.Data))
+| extend Error = todynamic(tostring(customDimensions.error))
+| project
+    timestamp,
+    id,
+    environmentId = customDimensions.environmentId,
+    DisplayName = Data.FlowDisplayName,
+    name,
+    RunID = Data.OriginRunId,
+    ErrorCode = Error.code,
+    ErrorMessage = Error.message,
+    success
+"""
 
 # Define severity levels for better readability
 SEVERITY_LEVELS = {
     1: "Critical",
-    2: "High",
-    3: "Medium",
-    4: "Low",
-    # Add more as needed based on your data
+    2: "Warning",
+    3: "Info"
 }
 
 # --- Helper Functions ---
@@ -89,12 +114,54 @@ def load_azure_table_data():
         st.error(f"Error connecting to Azure Table Storage. Please check your connection string and table name: {str(e)}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=300) # Cache data for 5 mins
+def load_loganalytics_data():
+    """Load data from Azure Log Analytics"""
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": LOG_ANALYTICS_API_KEY # Corrected access for API key
+        }
+        body = {"query": requests_query} # Corrected access for query string
+        response = requests.post(LOG_ANALYTICS_API_URL, headers=headers, json=body)
+        response.raise_for_status() # Raise an exception for HTTP errors
+        data = response.json()
+        
+        # Extract columns and rows from the 'tables' key in the response
+        if 'tables' in data and len(data['tables']) > 0:
+            columns = [col['name'] for col in data['tables'][0]['columns']]
+            rows = data['tables'][0]['rows']
+            df = pd.DataFrame(rows, columns=columns)
+            
+            # Convert 'timestamp' to datetime and localize to UTC
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+            
+            # Convert 'success' to boolean
+            if 'success' in df.columns:
+                df['success'] = df['success'].astype(bool)
+
+            return df
+        else:
+            st.warning("No data found in Azure Log Analytics for the specified query.")
+            return pd.DataFrame()
+    
+    except requests.exceptions.RequestException as req_err:
+        st.error(f"Network or HTTP error connecting to Azure Log Analytics: {req_err}")
+        return pd.DataFrame()
+    except json.JSONDecodeError:
+        st.error("Failed to decode JSON response from Azure Log Analytics. Check API key and query.")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"An unexpected error occurred while loading Log Analytics data: {str(e)}")
+        return pd.DataFrame()
+
 def render_metric_card(value, label):
-    """Renders a styled metric card."""
+    """Renders a styled metric card with larger, centered value."""
     st.markdown(f"""
-    <div class='stats-card'>
-        <p class='metric-value'>{value}</p>
-        <p class='metric-label'>{label}</p>
+    <div class='stats-card' style="text-align: center;">
+        <p class='metric-value' style="font-size: 3rem; text-align: center; margin: 0;">{value}</p>
+        <p class='metric-label' style="text-align: center; margin: 0;">{label}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -102,120 +169,237 @@ def render_metric_card(value, label):
 
 st.markdown("<h1 class='main-header'>FinTrU Application Health Checks Dashboard</h1>", unsafe_allow_html=True)
 
-# Load alert data
-alerts_df = load_azure_table_data()
-
-# Check if dataframe is empty after loading
-if alerts_df.empty:
-    st.warning("No data available to display. Please ensure Azure Table Storage is populated.")
-    # Exit early if no data
-    st.stop()
-
 # Create tabs
-tab1, tab2 = st.tabs(["Overview", "Support Alerts"])
+tab1, tab2, tab3 = st.tabs(["Overview", "Support Alerts", "Power Automate"])
 
 with tab1:
-    st.markdown("<h2 class='sub-header'>Dashboard Overview</h2>", unsafe_allow_html=True)
+    st.subheader("Alerts Overview")
     
-    # Metrics
-    col1, col2, col3 = st.columns(3)
+    # Load alert data for Overview tab
+    alerts_df = load_azure_table_data()
 
-    with col1:
-        past7_alerts_df = alerts_df[alerts_df['TimeAlertReceived'] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=7))]
-        render_metric_card(len(past7_alerts_df), "Alerts - last 7 days")
-    
-    with col2:
-        past1_alerts_df = alerts_df[alerts_df['TimeAlertReceived'] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=1))]
-        render_metric_card(len(past1_alerts_df), "Alerts - last 24 hours")
-    
-    with col3:
-        # Using the mapped 'Critical' string now
-        critical_alerts = len(alerts_df[alerts_df['SeverityLevel'] == SEVERITY_LEVELS.get(1)]) if 'SeverityLevel' in alerts_df.columns else 0
-        render_metric_card(critical_alerts, "Critical Alerts")
-    
-    # Charts
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Alerts by Source")
-        if 'Source' in alerts_df.columns and not alerts_df['Source'].empty:
-            status_counts = alerts_df['Source'].value_counts().reset_index(name='Count')
-            status_counts.columns = ['Source', 'Count'] # Ensure consistent column names
-            
-            fig = px.pie(status_counts, values='Count', names='Source', hole=0.4)
-            fig.update_traces(textinfo='label+value', hovertemplate='%{label}: %{value}')
-            fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No source data available for charting.")
-    
-    with col2:
-        st.subheader("Alerts by Severity")
-        if 'SeverityLevel' in alerts_df.columns and not alerts_df['SeverityLevel'].empty:
-            priority_counts = alerts_df['SeverityLevel'].value_counts().reset_index(name='Count')
-            priority_counts.columns = ['Severity', 'Count'] # Ensure consistent column names
-            
-            fig = px.bar(priority_counts, x='Severity', y='Count', color='Severity',
-                         category_orders={"Severity": list(SEVERITY_LEVELS.values())}) # Order bars
-            fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No severity data available for charting.")
-    
-    # Recent Activity
-    st.subheader("Recent Activity")
-    if 'TimeAlertReceived' in alerts_df.columns and not alerts_df.empty:
-        recent_alerts = alerts_df.sort_values('TimeAlertReceived', ascending=False).head(5)
-        # Select specific columns for display in recent activity for brevity
-        display_columns = ['TimeAlertReceived', 'Source', 'SeverityLevel', 'ErrorMessage']
-        st.dataframe(recent_alerts[display_columns], use_container_width=True, hide_index=True)
+    # Check if dataframe is empty after loading
+    if alerts_df.empty:
+        st.warning("No data available from Azure Table Storage for Overview. Please ensure it is populated.")
     else:
-        st.info("No recent activity data available.")
+        # Metrics
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            past7_alerts_df = alerts_df[alerts_df['TimeAlertReceived'] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=7))]
+            render_metric_card(len(past7_alerts_df), "Alerts - last 7 days")
+        
+        with col2:
+            past1_alerts_df = alerts_df[alerts_df['TimeAlertReceived'] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=1))]
+            render_metric_card(len(past1_alerts_df), "Alerts - last 24 hours")
+        
+        with col3:
+            critical_alerts = len(alerts_df[alerts_df['SeverityLevel'] == SEVERITY_LEVELS.get(1)]) if 'SeverityLevel' in alerts_df.columns else 0
+            render_metric_card(critical_alerts, "Critical Alerts")
+        
+        # Charts
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Alerts by Source")
+            if 'Source' in alerts_df.columns and not alerts_df['Source'].empty:
+                status_counts = alerts_df['Source'].value_counts().reset_index(name='Count')
+                status_counts.columns = ['Source', 'Count'] 
+                
+                fig = px.pie(status_counts, values='Count', names='Source', hole=0.4)
+                fig.update_traces(textinfo='label+value', hovertemplate='%{label}: %{value}')
+                fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No source data available for charting.")
+        
+        with col2:
+            st.subheader("Alerts by Severity")
+            if 'SeverityLevel' in alerts_df.columns and not alerts_df['SeverityLevel'].empty:
+                priority_counts = alerts_df['SeverityLevel'].value_counts().reset_index(name='Count')
+                priority_counts.columns = ['Severity', 'Count'] 
+                
+                fig = px.bar(priority_counts, x='Severity', y='Count', color='Severity',
+                             category_orders={"Severity": list(SEVERITY_LEVELS.values())}) 
+                fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No severity data available for charting.")
+        
+        # Recent Activity
+        st.subheader("Recent Activity")
+        if 'TimeAlertReceived' in alerts_df.columns and not alerts_df.empty:
+            recent_alerts = alerts_df.sort_values('TimeAlertReceived', ascending=False).head(5)
+            display_columns = ['TimeAlertReceived', 'Source', 'SeverityLevel', 'ErrorMessage']
+            st.dataframe(recent_alerts[display_columns], use_container_width=True, hide_index=True)
+        else:
+            st.info("No recent activity data available.")
 
 with tab2:
     st.markdown("<h2 class='sub-header'>Support Alerts</h2>", unsafe_allow_html=True)
     
-    # Filters in horizontal layout
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Use the mapped severity levels for the selectbox options
-        source_options = ['All'] + sorted(alerts_df['Source'].unique().tolist()) if 'Source' in alerts_df.columns else ['All']
-        selected_source = st.selectbox("Filter by Source", source_options)
-    
-    with col2:
-        severity_options = ['All'] + sorted(list(SEVERITY_LEVELS.values()), key=lambda x: list(SEVERITY_LEVELS.values()).index(x)) if 'SeverityLevel' in alerts_df.columns else ['All']
-        selected_priority = st.selectbox("Filter by Severity", severity_options)
-    
-    # Apply filters
-    filtered_df = alerts_df.copy()
-    
-    if selected_source != 'All' and 'Source' in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df['Source'] == selected_source]
-    
-    if selected_priority != 'All' and 'SeverityLevel' in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df['SeverityLevel'] == selected_priority]
-    
-    # Display filtered data with selected columns in order and sorted
-    columns_to_display = ['TimeAlertReceived', 'Source', 'SeverityLevel', 'ErrorCode', 'ErrorMessage', 'Link', 'StackTrace', 'AdditionalData']
-    if not filtered_df.empty:
-        sorted_df = filtered_df.sort_values('TimeAlertReceived', ascending=False) # Display newest first
-        st.dataframe(sorted_df[columns_to_display], use_container_width=True, hide_index=True)
+    # Load alert data for Support Alerts tab
+    alerts_df = load_azure_table_data()
+
+    if alerts_df.empty:
+        st.warning("No data available from Azure Table Storage for Support Alerts. Please ensure it is populated.")
     else:
-        st.info("No alerts match the selected filters.")
+        # Filters in horizontal layout
+        col1, col2 = st.columns(2)
         
-    # Alert trend over time
-    st.subheader("Alert Creation Trend")
-    
-    if 'TimeAlertReceived' in alerts_df.columns and not alerts_df.empty:
-        alerts_df['Date'] = alerts_df['TimeAlertReceived'].dt.date
-        trend_df = alerts_df.groupby('Date').size().reset_index(name='Count')
+        with col1:
+            source_options = ['All'] + sorted(alerts_df['Source'].unique().tolist()) if 'Source' in alerts_df.columns else ['All']
+            selected_source = st.selectbox("Filter by Source", source_options)
         
-        fig = px.line(trend_df, x='Date', y='Count', markers=True, title="Number of Alerts Over Time")
-        fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
-        st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            severity_options = ['All'] + sorted(list(SEVERITY_LEVELS.values()), key=lambda x: list(SEVERITY_LEVELS.values()).index(x)) if 'SeverityLevel' in alerts_df.columns else ['All']
+            selected_priority = st.selectbox("Filter by Severity", severity_options)
+        
+        # Apply filters
+        filtered_df = alerts_df.copy()
+        
+        if selected_source != 'All' and 'Source' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['Source'] == selected_source]
+        
+        if selected_priority != 'All' and 'SeverityLevel' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['SeverityLevel'] == selected_priority]
+        
+        # Display filtered data with selected columns in order and sorted
+        columns_to_display = ['TimeAlertReceived', 'Source', 'SeverityLevel', 'ErrorCode', 'ErrorMessage', 'Link', 'StackTrace', 'AdditionalData']
+        if not filtered_df.empty:
+            sorted_df = filtered_df.sort_values('TimeAlertReceived', ascending=False) # Display newest first
+            st.dataframe(sorted_df[columns_to_display], use_container_width=True, hide_index=True)
+        else:
+            st.info("No alerts match the selected filters.")
+            
+        # Alert trend over time
+        st.subheader("Alert Creation Trend")
+        
+        if 'TimeAlertReceived' in alerts_df.columns and not alerts_df.empty:
+            alerts_df['Date'] = alerts_df['TimeAlertReceived'].dt.date
+            trend_df = alerts_df.groupby('Date').size().reset_index(name='Count')
+            
+            fig = px.line(trend_df, x='Date', y='Count', markers=True, title="Number of Alerts Over Time")
+            fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No alert creation trend data available.")
+
+with tab3: # New Power Automate Tab
+    st.markdown("<h2 class='sub-header'>Power Automate Flow Monitoring</h2>", unsafe_allow_html=True)
+
+    # Load Power Automate data
+    flow_runs_df = load_loganalytics_data()
+
+    if flow_runs_df.empty:
+        st.warning("No data available from Azure Log Analytics for Power Automate. Please ensure it is populated and the query is correct.")
     else:
-        st.info("No alert creation trend data available.")
+        # Metrics for Power Automate
+        st.subheader("Flow Run Metrics")
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            # All runs in the last 7 days
+            past7_runs_df = flow_runs_df[flow_runs_df['timestamp'] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=7))]
+            render_metric_card(len(past7_runs_df), "Total Runs - last 7 days")
+        
+        with col2:
+            # Failed runs in the last 24 hours
+            past1_failed_runs_df = flow_runs_df[
+                (flow_runs_df['timestamp'] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=1))) &
+                (flow_runs_df['success'] == False)
+            ]
+            render_metric_card(len(past1_failed_runs_df), "Failed Runs - last 24 hours")
+        
+        with col3:
+            # Successful runs in the last 24 hours
+            past1_successful_runs_df = flow_runs_df[
+                (flow_runs_df['timestamp'] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=1))) &
+                (flow_runs_df['success'] == True)
+            ]
+            render_metric_card(len(past1_successful_runs_df), "Successful Runs - last 24 hours")
+
+        # Charts for Power Automate
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Flow Run Status Distribution")
+            if 'success' in flow_runs_df.columns and not flow_runs_df['success'].empty:
+                status_counts = flow_runs_df['success'].value_counts().reset_index(name='Count')
+                status_counts.columns = ['Status', 'Count']
+                status_counts['Status'] = status_counts['Status'].map({True: 'Successful', False: 'Failed'})
+                
+                fig = px.pie(status_counts, values='Count', names='Status', hole=0.4,
+                             color_discrete_map={'Successful':'green', 'Failed':'red'})
+                fig.update_traces(textinfo='label+percent', hovertemplate='%{label}: %{value} (%{percent})')
+                fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No run status data available for charting.")
+        
+        with col2:
+            st.subheader("Top 5 Failing Flows")
+            failed_flows_df = flow_runs_df[flow_runs_df['success'] == False]
+            if 'DisplayName' in failed_flows_df.columns and not failed_flows_df.empty:
+                top_failed_flows = failed_flows_df['DisplayName'].value_counts().head(5).reset_index(name='Failures')
+                top_failed_flows.columns = ['Flow Display Name', 'Failures']
+
+                fig = px.bar(top_failed_flows, x='Flow Display Name', y='Failures', color='Failures',
+                             title="Top 5 Power Automate Flows with Failures")
+                fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No failed flow data available for charting.")
+
+        # Flow Run Trend over Time
+        st.subheader("Power Automate Flow Run Trend")
+        if 'timestamp' in flow_runs_df.columns and not flow_runs_df.empty:
+            flow_runs_df['Date'] = flow_runs_df['timestamp'].dt.date
+            trend_df = flow_runs_df.groupby('Date').size().reset_index(name='Count')
+            
+            fig = px.line(trend_df, x='Date', y='Count', markers=True, title="Number of Flow Runs Over Time")
+            fig.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No flow run trend data available.")
+
+        # Table for Recent Failed Runs
+        st.subheader("Recent Failed Flow Runs")
+        failed_runs_sorted_df = flow_runs_df[flow_runs_df['success'] == False].sort_values('timestamp', ascending=False)
+        if not failed_runs_sorted_df.empty:
+            display_cols_failed = ['timestamp', 'DisplayName', 'ErrorCode', 'ErrorMessage', 'RunID']
+            st.dataframe(failed_runs_sorted_df[display_cols_failed], use_container_width=True, hide_index=True)
+        else:
+            st.info("No recent failed flow runs to display.")
+
+        # Filterable Table for All Flow Runs
+        st.subheader("All Flow Runs")
+        
+        col_flt1, col_flt2 = st.columns(2)
+        with col_flt1:
+            flow_display_name_options = ['All'] + sorted(flow_runs_df['DisplayName'].unique().tolist()) if 'DisplayName' in flow_runs_df.columns else ['All']
+            selected_flow_display_name = st.selectbox("Filter by Flow Display Name", flow_display_name_options)
+        with col_flt2:
+            success_status_options = ['All', 'Successful', 'Failed']
+            selected_success_status = st.selectbox("Filter by Run Status", success_status_options)
+
+        filtered_flow_runs_df = flow_runs_df.copy()
+
+        if selected_flow_display_name != 'All' and 'DisplayName' in filtered_flow_runs_df.columns:
+            filtered_flow_runs_df = filtered_flow_runs_df[filtered_flow_runs_df['DisplayName'] == selected_flow_display_name]
+        
+        if selected_success_status != 'All' and 'success' in filtered_flow_runs_df.columns:
+            if selected_success_status == 'Successful':
+                filtered_flow_runs_df = filtered_flow_runs_df[filtered_flow_runs_df['success'] == True]
+            elif selected_success_status == 'Failed':
+                filtered_flow_runs_df = filtered_flow_runs_df[filtered_flow_runs_df['success'] == False]
+
+        if not filtered_flow_runs_df.empty:
+            display_cols_all_runs = ['timestamp', 'DisplayName', 'success', 'ErrorCode', 'ErrorMessage', 'RunID']
+            st.dataframe(filtered_flow_runs_df.sort_values('timestamp', ascending=False)[display_cols_all_runs], use_container_width=True, hide_index=True)
+        else:
+            st.info("No flow runs match the selected filters.")
+
 
 # Refresh button
 if st.button("Refresh Data"):
