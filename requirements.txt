@@ -1,1 +1,5 @@
-streamlit
+streamlit==1.35.0
+pandas==2.2.0
+plotly==5.18.0
+azure-data-tables==12.5.0
+azure-core==1.29.5
